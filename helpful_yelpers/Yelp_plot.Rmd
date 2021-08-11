@@ -1,0 +1,188 @@
+---
+title: "Who are the most helpful Yelpers?"
+output:
+  html_document:
+    df_print: paged
+---
+This Visualization aims to characterize the 2000 most helpful Yelp users ("Yelpers") ranked by the amount of "useful" votes their reviews have gotten. To characterize them, we look for information about them which corrolates strongly with the amount of useful votes for each user. We will also look at what businesses they are reviewing and when they joined Yelp.
+
+To start we need to import the necessary libraries. We need tidyverse, dbplyr, lubridate and zoo for general data processing, RMySQL to establish a connection with the database, plotly to draw the plots and crosstalk to link the plots.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+library(tidyverse)
+library(RMySQL)
+library(dbplyr)
+library(plotly)
+library(crosstalk)
+library(zoo)
+library(lubridate)
+library(dotenv)
+```
+
+Next we need to setup the environment of the notebook to correctly convert encodings and use mapbox with our token.
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+Sys.setlocale('LC_ALL','C') # make sure input with marked encodings can be converted
+load_dot_env() # load hidden environment
+
+# mapboxToken <- "pk.eyJ1IjoidGltaGV1IiwiYSI6ImNrYzN0N3F1MDAxOGwyeG1pOGJvbGN6eDEifQ.R96jvgC1Clp8Uhi4mPf-wQ"
+# Sys.setenv("MAPBOX_TOKEN" = mapboxToken) # setup map info
+```
+
+We establish a connection with the database and run our queries. The first of which returns the 2000 most helpful Yelpers, measured in sum of "useful" votes on their reviews, as users. The second query returns all businesses visited by the top 2000 useful Yelpers and the sum of all useful votes of those users, as well as the date of the first review.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+driver <- dbDriver("MySQL")
+
+connection <- dbConnect(driver,
+                        host = Sys.getenv("DB_HOST"), 
+                        port = 3306,
+                        dbname = Sys.getenv("DB_NAME"),
+                        user = Sys.getenv("DB_USER"), password = Sys.getenv("DB_PASSWORD"))
+
+users <- dbGetQuery(connection, statement = "
+                  SELECT u.id, u.name, u.review_count, u.yelping_since, u.useful, u.funny, u.cool,
+                  u.fans, u.average_stars, COUNT(e.year) AS elite_years
+                  FROM user u LEFT JOIN elite_years e
+                  ON u.id = e.user_id
+                  GROUP BY u.id
+                  ORDER BY u.useful DESC
+                  LIMIT 2000")
+users$yelping_since <- as.Date(users$yelping_since) # convert chr to datetime
+
+businesses <- dbGetQuery(connection, statement = "
+                  SELECT b.id, b.name, b.neighborhood, b.city, b.latitude, b.longitude, b.stars,
+                  b.review_count, b.is_open, SUM(u.useful) AS useful_sum, MIN(r.date) as first_review
+                  FROM business b JOIN review r ON b.id = r.business_id
+                  JOIN user u ON u.id = r.user_id
+                  INNER JOIN (SELECT u.id
+                              FROM user u
+                              ORDER BY u.useful DESC
+                              LIMIT 2000) as u2
+                    ON u.id = u2.id
+                  GROUP BY b.id")
+```
+
+We have to do some preprocessing to those queries to create interesting plots.
+
+For the businesses, we calculate the days since opening (approximated by the first review for that business), which we use to get the average sum of useful votes per year as well as the average amount of reviews per year this business has gotten. This helps to minimize bias against businesses who opened later than others (and therefore tend to have less reviews). We also calculate the logarithms of those for plotting later. We also filter out some businesses which have a wrong longitude/latitude and are therefore not where they should be.
+
+For the users we calculate the days since they created their yelp accounts to get the features per year in a similar fashion. This again helps to minimize bias against users who joined later than others (and therefore have had less opportunities to review businesses or get votes on their reviews). We also generate a column on whether or not they had an elite membership at one point.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+businesses_norm <- businesses %>%
+  na.omit() %>%
+  filter(latitude>=35.6 & longitude>=-115.8 & latitude<=36.5 & longitude<=-114.7 & (city=="Las Vegas" | city=="Henderson")
+         | city!="Las Vegas") %>% # filter out businesses who have position outside of Las Vegas/Henderson City
+  filter(latitude>=35.0 & longitude>=-81.0 & latitude<=35.4 & longitude<=-80.6 & city=="Charlotte"
+         | city!="Charlotte") %>% # filter out businesses who have a geoposition outside of Charlotte
+  filter(latitude>=32.73 & longitude>=-112.76 & latitude<=33.93 & longitude<=-111.35 & city=="Litchfield Park"
+         | city!="Litchfield Park") %>% # filter out businesses who have a geoposition outside of Litchfield Park
+  filter(latitude>=41.24 & longitude>=-81.90 & latitude<=41.70 & longitude<=-81.22 & city=="Highland Heights"
+         | city!="Highland Heights") %>% # filter out businesses who have a geoposition outside of Litchfield Park
+  mutate(days_open = Sys.Date() - ymd(ymd(substr(first_review, 0, 10)))) %>% # days since opening
+  mutate(useful_year = 365*(useful_sum / as.numeric(days_open))) %>% # useful votes per year
+  mutate(useful_year_log = log(useful_year, 20)) %>% # log
+  mutate(open_string = ifelse(is_open > 0, "Yes", "No")) %>% # string whether business is still open
+  mutate(review_count_year = 365*(review_count / as.numeric(days_open))) %>% # reviews per year
+  mutate(review_count_year_trans = 7*log10(review_count_year)) # log
+
+users_sampled <- users %>%
+  na.omit() %>%
+  filter(review_count > 0) %>% # filter out one hit wonders
+  mutate(days_yelping = Sys.Date() - ymd(yelping_since)) %>% # calculate days since account was created
+  mutate(other_votes = funny + cool) %>% # calculate sum of other votes per year
+  mutate(other_votes_year = 365*(other_votes / as.numeric(days_yelping))) %>% # average sum of other awards per year
+  mutate(useful_year = 365*(useful / as.numeric(days_yelping))) %>% # calculate average useful votes per year
+  mutate(fans_year = 365*(fans / as.numeric(days_yelping))) %>% # calculate average fans per year
+  mutate(reviews_year = 365*(review_count / as.numeric(days_yelping))) %>% # calculate average reviews per year
+  mutate(year_joint = as.character(year(yelping_since))) %>%
+  mutate(elite_bin = ifelse(elite_years > 0, "Elite", "Non Elite")) # binary value whether elite membership was bought
+```
+
+Lets look at some correlations between the given variables and the useful_votes per year, to see what we should plot to characterize helpful yelpers. As we can see, other votes is by far the strongest predictor, followed by amount of net new fans per year and reviews written. Average stars and number of elite years do not correlate as strongly with useful votes per year. Therefore, we will create a plot for other votes, as well as fans per year and we will use the third strongest predictor to color the observations.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+cor_votes <- round(cor(users_sampled$other_votes_year, users_sampled$useful_year), 2) # correlation for votes
+cor_reviews <- round(cor(users_sampled$reviews_year, users_sampled$useful_year), 2) # correlation for reviews per year
+cor_fans <- round(cor(users_sampled$fans_year, users_sampled$useful_year), 2) # correlation for fans per year
+cor_elite <- round(cor(users_sampled$elite_years, users_sampled$useful_year), 2) # correlation for amount of elite years
+cor_stars <- round(cor(users_sampled$average_stars, users_sampled$useful_year), 2) # correlation for average stars
+
+cat(paste("Correlation between useful votes per year and...",
+"\n...funny and cool votes per year is", cor_votes,
+"\n...amount of net new fans per year is", cor_fans,
+"\n...reviews written per year is", cor_reviews,
+"\n...average given stars is", cor_stars,
+"\n...elite years is", cor_elite))
+```
+
+Now we can finally start to generate some plots. We start by creating a shared data object, from which the plots can be created.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+shared <- SharedData$new(users_sampled, key = ~year_joint)
+```
+
+The first plot for displaying funny and cool votes per year against the useful votes per year, colored by the reviews written per year, with a trendline.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+votes_plot <- shared %>%
+  plot_ly(x = ~other_votes_year, y = ~useful_year, color = ~log(reviews_year, base=30), hoverinfo = "text",
+          text = ~paste("Username:", name, "<br>Average useful votes per year:",
+                        round(useful_year), "<br>Average funny or cool votes per year:", round(other_votes_year),
+                        "<br>Average Fans per year:", round(fans_year), "<br>Average reviews per year:",
+                        round(reviews_year), "<br>Yelping since:", yelping_since), showlegend = FALSE) %>% # set hovertext
+  add_markers(alpha=0.4) %>% # set low opacity
+  layout(xaxis = list(type = "log", title = "Average funny + cool votes per year"), # set x axis log scaling and title
+         yaxis = list(type = "log", title = "Average useful votes per year"), # set y axis
+         title = "Do useful Yelpers also get other votes?", showlegend = FALSE) %>% # set plot title
+  add_lines(y = ~fitted(lm(useful_year ~ other_votes_year)), color = I("#440154")) %>% # add trendline
+  hide_colorbar() %>%
+  highlight(on = "plotly_click", off = "plotly_doubleclick") # highlight when clicked
+```
+
+The second plot for displaying net new fans per year per year against the useful votes per year, colored by the reviews written per year, with a trendline.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+fans_plot <- shared %>%
+  plot_ly(x = ~fans_year, y = ~useful_year, color = ~log(reviews_year, base=20), hoverinfo = "text", showlegend = FALSE,
+          text = ~paste("Username:", name, "<br>Average useful votes per year:",
+                        round(useful_year), "<br>Average funny or cool votes per year:", round(other_votes_year),
+                        "<br>Average Fans per year:", round(fans_year), "<br>Average reviews per year:",
+                        round(reviews_year), "<br>Yelping since:", yelping_since)) %>%
+  add_markers(alpha=0.4) %>% # set low opacity
+  layout(xaxis = list(type = "log", title = "Average number of net new fans per year"), # set xaxis log scaling and title
+         yaxis = list(type = "log", title = "", showticklabels = FALSE), # hide y axis
+         title = "How many fans do they have?", width = 572) %>% # set plot title
+  add_lines(y = ~fitted(lm(useful_year ~ fans_year)), color = I("#440154")) %>%
+  highlight(on = "plotly_click", off = "plotly_doubleclick") %>% # highlight when clicked
+  colorbar(title = "reviews/year", showticklabels = FALSE)
+```
+
+The third plot for displaying the businesses visited by the top 2000 useful Yelpers on a map, colored by the sum of useful votes the user visiting this business get per year with a size difference correlating to the amount of reviews this business gets per year.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+map <- plot_mapbox(data = businesses_norm) %>%
+  layout(mapbox = list(style = "light", center = list(lon = -79.4, lat = 43.7), zoom = 4), # light map, center on Toronto
+         title = "Which businesses do they visit?", width=600) %>% # set plot title
+  add_markers(x = ~longitude, y = ~latitude, hoverinfo = "text", alpha=0.8, color = ~useful_year_log,
+              size = ~review_count_year_trans,
+              text = ~paste("Name:", name, "<br>City:", city, "<br>Average Stars:", stars,
+                            "<br>UsefulUserScore*:", round(useful_year_log, 1), "<br>Numer of Reviews per year:",
+                            round(review_count_year), "<br>Total number of reviews:", review_count,
+                            "<br>Open:", open_string)) %>% # set hovertext
+  colorbar(title = "UsefulUserScore*") # title for colorbar
+```
+
+
+Lastly we create a barplot for displaying in which year these Yelpers joined yelp.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+bar <- shared %>%
+  plot_ly() %>%
+  group_by(year_joint) %>% # aggregate users per year
+  summarise(n=n()) %>%
+  # count(year_joint) %>% # aggregate users per year
+  add_bars(x = ~year_joint, y = ~n, color = I("#26828e"), hoverinfo = "text",
+           text = ~paste0("In ", year_joint,", ", n, " of the helpful yelpers joined")) %>%
+  layout(barmode = "overlay",
+         xaxis = list(title = ""), yaxis = list(title = "Number of Users joined"), # set x and y axis title
+         title = "When did they join Yelp?") %>% # set plot title
+  highlight(on = "plotly_click", off = "plotly_doubleclick")  # highlight when clicked
+```
+
+To tie everything together we create a bscols object, which displays all four plots in one place to see who the most helpful Yelpers are! You can click on one of the bars in the bar chart or one of the points in the scatterplots to highlight Yelpers who joined in the same year.
+```{r}
+bscols(list(votes_plot, bar), list(fans_plot, map))
+```
+*the UsefulUserScore describes the average sum of useful votes for all the top 2000 Yelpers (measured by useful votes) per year visiting this business.
